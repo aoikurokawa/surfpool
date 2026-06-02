@@ -8,7 +8,10 @@ use litesvm::{
 };
 use solana_account::{Account, AccountSharedData};
 use solana_clock::Clock;
-use solana_loader_v3_interface::get_program_data_address;
+use solana_loader_v3_interface::{
+    get_program_data_address,
+    state::UpgradeableLoaderState,
+};
 use solana_program_option::COption;
 use solana_pubkey::Pubkey;
 use solana_slot_hashes::SlotHashes;
@@ -54,25 +57,31 @@ impl SurfnetLiteSvm {
     /// Initializes LiteSVM with as few settings as possible; for initial startup of VM
     /// that will be overriden later when more context is available.
     fn base_litesvm_settings() -> LiteSVM {
-        LiteSVM::default()
+        let mut svm = LiteSVM::default()
             .with_feature_set(FeatureSet::default()) // start with all features enabled, but don't load feature accounts
             .with_builtins()
             .with_lamports(1_000_000u64.wrapping_mul(LAMPORTS_PER_SOL))
             .with_sysvars()
             .with_default_programs()
             .with_blockhash_check(false)
-            .with_sigverify(false)
+            .with_sigverify(false);
+        fix_stake_history_size(&mut svm);
+        svm
     }
 
     /// Initializes LiteSVM with full settings; starts with base settings, then adds in
     /// features and other setup that depends on the feature set.
     fn full_litesvm_settings(feature_set: FeatureSet) -> LiteSVM {
-        Self::base_litesvm_settings()
+        // with_sysvars() re-runs here (after base already ran it), re-introducing the padded
+        // 16 KiB StakeHistory. Fix it again after the final with_sysvars() call.
+        let mut svm = Self::base_litesvm_settings()
             .with_feature_set(feature_set)
             .with_feature_accounts()
             .with_builtins()
             .with_sysvars()
-            .with_default_programs()
+            .with_default_programs();
+        fix_stake_history_size(&mut svm);
+        svm
     }
 
     pub fn initialize(
@@ -122,58 +131,30 @@ impl SurfnetLiteSvm {
             return;
         }
 
-        // Preserve all critical sysvars/config accounts across garbage collection
-        // - RecentBlockhashes: for blockhash validation
-        // - SlotHashes: for ALT resolution
-        // - Clock: for time-dependent programs
-        // - StakeHistory: for Stake program Split/Deactivate instructions (accessed via syscall)
-        // - StakeConfig: LiteSVM default is too small for the Stake program to deserialize
-        // - Stake program + programdata: mainnet version replaces outdated bundled ELF
+        // Preserve sysvars that were set from remote (not recreated by full_litesvm_settings)
         let recent_blockhashes = self.svm.get_sysvar::<RecentBlockhashes>();
         let slot_hashes = self.svm.get_sysvar::<SlotHashes>();
         let clock = self.svm.get_sysvar::<Clock>();
-        let stake_history_account =
-            self.svm.get_account(&solana_sdk_ids::sysvar::stake_history::id());
+        // Note: StakeHistory is intentionally NOT preserved across GC — we use the
+        // vendor-patched exact-size empty sysvar to avoid epoch-gap panics in Merge.
         let stake_config_account =
             self.svm.get_account(&solana_sdk_ids::stake::config::id());
-        let stake_program_account =
-            self.svm.get_account(&solana_sdk_ids::stake::id());
-        let stake_programdata_account = self.svm.get_account(
-            &solana_loader_v3_interface::get_program_data_address(&solana_sdk_ids::stake::id()),
-        );
 
         // todo: this is also resetting the log bytes limit and airdrop keypair, would be nice to avoid
         self.svm = Self::full_litesvm_settings(feature_set);
 
         create_native_mint(self);
 
-        // Restore all preserved sysvars/config accounts
+        // Restore sysvars
         self.svm.set_sysvar(&recent_blockhashes);
         self.svm.set_sysvar(&slot_hashes);
         self.svm.set_sysvar(&clock);
-        if let Some(account) = stake_history_account {
-            let _ = self
-                .svm
-                .set_account(solana_sdk_ids::sysvar::stake_history::id(), account);
-        }
         if let Some(account) = stake_config_account {
             let _ = self
                 .svm
                 .set_account(solana_sdk_ids::stake::config::id(), account);
         }
-        // Restore the mainnet Stake program (programdata first, then program account
-        // to trigger program cache recompilation)
-        if let (Some(programdata), Some(program)) =
-            (stake_programdata_account, stake_program_account)
-        {
-            let programdata_address = solana_loader_v3_interface::get_program_data_address(
-                &solana_sdk_ids::stake::id(),
-            );
-            let _ = self.svm.set_account(programdata_address, programdata);
-            let _ = self
-                .svm
-                .set_account(solana_sdk_ids::stake::id(), program);
-        }
+        // The bundled stake ELF (v5.0.0) is loaded automatically by full_litesvm_settings.
     }
 
     pub fn apply_feature_config(&mut self, feature_set: FeatureSet) -> &mut Self {
@@ -350,6 +331,41 @@ impl SurfnetLiteSvm {
             .into_iter()
             .sorted_by(|a, b| a.0.cmp(&b.0))
             .collect())
+    }
+}
+
+/// Overwrite the padded StakeHistory sysvar with the exact serialized size.
+///
+/// LiteSVM's `set_sysvar(&StakeHistory::default())` allocates `StakeHistory::size_of()` bytes
+/// (hard-coded to 16 KiB for 512 max entries). The sysvar cache stores raw bytes and
+/// `sol_get_sysvar` reads directly from them. Reads beyond the actual data succeed but return
+/// zeros, which causes the Core BPF stake program to panic (it asserts `entry_epoch ==
+/// target_epoch` after each partial read). An empty StakeHistory serialises to exactly 8 bytes
+/// (a u64 length of 0), so reads beyond that boundary fail cleanly instead of returning zeros.
+///
+/// This must be called after every `with_sysvars()` invocation in the LiteSVM builder chain.
+/// When a remote StakeHistory is later loaded, it overrides this default with real mainnet data.
+fn fix_stake_history_size(svm: &mut LiteSVM) {
+    let result = svm.set_account(
+        solana_sdk_ids::sysvar::stake_history::id(),
+        Account {
+            lamports: 1,
+            data: vec![0u8; 8], // bincode(empty StakeHistory) = u64 length 0
+            owner: solana_sdk_ids::sysvar::id(),
+            executable: false,
+            rent_epoch: u64::MAX,
+        },
+    );
+    if let Err(e) = result {
+        // This would prevent the panic-on-zeros bug described in the comment above.
+        // If it fails, the 16 KiB padded buffer remains and stake operations at
+        // epoch >= 1 will panic inside the stake program.
+        log::warn!("fix_stake_history_size: set_account failed: {e:?}");
+    } else {
+        // Verify the size actually changed
+        if let Some(account) = svm.get_account(&solana_sdk_ids::sysvar::stake_history::id()) {
+            log::debug!("StakeHistory size after fix: {} bytes", account.data.len());
+        }
     }
 }
 

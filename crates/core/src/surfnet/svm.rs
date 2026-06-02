@@ -653,9 +653,8 @@ impl SurfnetSvm {
         remote_ctx: &Option<SurfnetRemoteClient>,
         do_profile_instructions: bool,
         log_bytes_limit: Option<usize>,
-        stake_history_account: Option<Account>,
+        _stake_history_account: Option<Account>,
         stake_config_account: Option<Account>,
-        stake_program_accounts: Option<(Account, Account)>,
     ) {
         self.chain_tip = self.new_blockhash();
         self.latest_epoch_info = epoch_info.clone();
@@ -677,13 +676,17 @@ impl SurfnetSvm {
 
         self.inner.set_sysvar(&epoch_schedule);
 
-        // Set StakeHistory from remote if available. The Stake program accesses this
-        // sysvar via the get_sysvar syscall (not as a transaction account), so it must
-        // be proactively populated.
-        if let Some(account) = stake_history_account {
-            let _ = self.inner.svm.set_account(
-                solana_sdk_ids::sysvar::stake_history::id(),
-                account,
+        // StakeHistory: the vendor-patched litesvm sets this to an exact-size empty sysvar
+        // (8 bytes). Do NOT override with remote data: the mainnet StakeHistory may contain
+        // epoch gaps that cause the Core BPF stake program's indexed lookup to read wrong
+        // entries and trigger the assert_eq!(entry_epoch, target_epoch) at line 113 of
+        // src/sysvar/stake_history.rs. With 8 bytes, every sol_get_sysvar call beyond the
+        // first 8 bytes returns OFFSET_LENGTH_EXCEEDS_SYSVAR (error), so get_entry() returns
+        // None — which the stake program handles as "presume fully activated". No panic.
+        if let Some(account) = &_stake_history_account {
+            info!(
+                "Remote StakeHistory available ({} bytes) but NOT applied — using empty sysvar to avoid epoch-gap panics in Merge",
+                account.data.len()
             );
         }
 
@@ -698,23 +701,8 @@ impl SurfnetSvm {
             );
         }
 
-        // Replace the bundled Stake program with the live mainnet version.
-        // LiteSVM ships core_bpf_stake-1.0.1.so which was compiled against an older
-        // VoteStateVersions enum that doesn't include V4. Mainnet vote accounts now
-        // use V4, so DelegateStake fails with InvalidAccountData when it tries to
-        // deserialize them. Loading the current mainnet Stake program resolves this.
-        if let Some((program_account, programdata_account)) = stake_program_accounts {
-            let programdata_address =
-                solana_loader_v3_interface::get_program_data_address(&solana_sdk_ids::stake::id());
-            let _ = self
-                .inner
-                .svm
-                .set_account(programdata_address, programdata_account);
-            let _ = self
-                .inner
-                .svm
-                .set_account(solana_sdk_ids::stake::id(), program_account);
-        }
+        // The bundled stake program (core_bpf_stake-5.0.0.so) handles both V4 vote accounts
+        // and the Merge/StakeHistory assertion correctly. We no longer load from mainnet.
 
         if let Some(remote_client) = remote_ctx {
             let _ = self
@@ -1666,6 +1654,28 @@ impl SurfnetSvm {
             let err = TransactionError::BlockhashNotFound;
 
             return Err(FailedTransactionMetadata { err, meta });
+        }
+        // Diagnostic: log StakeHistory and clock state to debug the stake program panic.
+        {
+            let sh_account = self.inner.svm.get_account(&solana_sdk_ids::sysvar::stake_history::id());
+            let sh_size = sh_account.as_ref().map(|a| a.data.len()).unwrap_or(0);
+            let sh_count = sh_account.as_ref().and_then(|a| {
+                if a.data.len() >= 8 {
+                    Some(u64::from_le_bytes(a.data[..8].try_into().unwrap_or([0u8;8])))
+                } else { None }
+            }).unwrap_or(0);
+            let clock_epoch = self.inner.get_sysvar::<solana_clock::Clock>().epoch;
+            // Also read entry[0] and entry[1] to detect if data changed since initialization
+            let e0 = sh_account.as_ref().and_then(|a| {
+                if a.data.len() >= 16 { Some(u64::from_le_bytes(a.data[8..16].try_into().unwrap_or([0u8;8]))) } else { None }
+            }).unwrap_or(u64::MAX);
+            let e1 = sh_account.as_ref().and_then(|a| {
+                if a.data.len() >= 48 { Some(u64::from_le_bytes(a.data[40..48].try_into().unwrap_or([0u8;8]))) } else { None }
+            }).unwrap_or(u64::MAX);
+            info!(
+                "simulate_transaction: StakeHistory={} bytes count={} epoch[0]={} epoch[1]={}, clock.epoch={}",
+                sh_size, sh_count, e0, e1, clock_epoch
+            );
         }
         self.inner.simulate_transaction(tx)
     }

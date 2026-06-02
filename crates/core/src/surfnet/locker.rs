@@ -236,14 +236,11 @@ impl SurfnetSvmLocker {
         };
         epoch_info.transaction_count = None;
 
-        // Fetch stake-related accounts from remote if available.
-        // - StakeHistory: accessed via get_sysvar syscall, not as a transaction account
-        // - StakeConfig: LiteSVM creates a minimal default that the Stake program can't
-        //   deserialize, so we overwrite it with the real mainnet data
-        // - Stake program + programdata: LiteSVM bundles an outdated stake ELF that
-        //   can't deserialize V4 vote accounts used on mainnet
+        // Fetch StakeHistory and StakeConfig from remote. The bundled stake ELF (v5.0.0)
+        // handles V4 vote accounts and Merge correctly, so we no longer need to load
+        // the stake program from mainnet.
         #[allow(deprecated)]
-        let (stake_history_account, stake_config_account, stake_program_accounts) =
+        let (stake_history_account, stake_config_account) =
             if let Some(remote_client) = remote_ctx {
                 let history = remote_client
                     .get_raw_account(&solana_sdk_ids::sysvar::stake_history::id())
@@ -255,39 +252,14 @@ impl SurfnetSvmLocker {
                     .await
                     .ok()
                     .flatten();
-                let stake_program = remote_client
-                    .get_raw_account(&solana_sdk_ids::stake::id())
-                    .await
-                    .ok()
-                    .flatten();
-                let stake_programdata = remote_client
-                    .get_raw_account(
-                        &solana_loader_v3_interface::get_program_data_address(
-                            &solana_sdk_ids::stake::id(),
-                        ),
-                    )
-                    .await
-                    .ok()
-                    .flatten();
-                let stake_prog = match (stake_program, stake_programdata) {
-                    (Some(prog), Some(data)) => {
-                        info!(
-                            "Fetched Stake program from remote: program={}, programdata={}",
-                            prog.data.len(),
-                            data.data.len(),
-                        );
-                        Some((prog, data))
-                    }
-                    _ => None,
-                };
                 info!(
                     "Fetched stake accounts from remote: StakeHistory={}, StakeConfig={}",
                     history.as_ref().map_or(0, |a| a.data.len()),
                     config.as_ref().map_or(0, |a| a.data.len()),
                 );
-                (history, config, stake_prog)
+                (history, config)
             } else {
-                (None, None, None)
+                (None, None)
             };
 
         self.with_svm_writer(|svm_writer| {
@@ -300,7 +272,6 @@ impl SurfnetSvmLocker {
                 log_bytes_limit,
                 stake_history_account,
                 stake_config_account,
-                stake_program_accounts,
             );
         });
         Ok(epoch_info)
@@ -2067,9 +2038,10 @@ impl SurfnetSvmLocker {
         };
         epoch_info.transaction_count = None;
 
-        // Re-fetch stake-related accounts from remote after reset (same as initialize)
+        // Re-fetch StakeHistory and StakeConfig from remote after reset.
+        // The bundled stake ELF (v5.0.0) is correct; no need to reload from mainnet.
         #[allow(deprecated)]
-        let (stake_history_account, stake_config_account, stake_program_accounts) =
+        let (stake_history_account, stake_config_account) =
             if let Some(remote_client) = remote_ctx {
                 let history = remote_client
                     .get_raw_account(&solana_sdk_ids::sysvar::stake_history::id())
@@ -2081,59 +2053,22 @@ impl SurfnetSvmLocker {
                     .await
                     .ok()
                     .flatten();
-                let stake_program = remote_client
-                    .get_raw_account(&solana_sdk_ids::stake::id())
-                    .await
-                    .ok()
-                    .flatten();
-                let stake_programdata = remote_client
-                    .get_raw_account(
-                        &solana_loader_v3_interface::get_program_data_address(
-                            &solana_sdk_ids::stake::id(),
-                        ),
-                    )
-                    .await
-                    .ok()
-                    .flatten();
-                let stake_prog = match (stake_program, stake_programdata) {
-                    (Some(prog), Some(data)) => Some((prog, data)),
-                    _ => None,
-                };
-                (history, config, stake_prog)
+                (history, config)
             } else {
-                (None, None, None)
+                (None, None)
             };
 
         self.with_svm_writer(move |svm_writer| {
             let _ = svm_writer.reset_network(epoch_info);
             let _ = svm_writer.offline_accounts.clear();
-            // Restore StakeHistory, StakeConfig, and Stake program after reset.
-            if let Some(account) = stake_history_account {
-                let _ = svm_writer.inner.svm.set_account(
-                    solana_sdk_ids::sysvar::stake_history::id(),
-                    account,
-                );
-            }
+            // StakeHistory is intentionally NOT restored — the empty sysvar from the
+            // vendor-patched litesvm prevents epoch-gap panics in the stake program's Merge.
             #[allow(deprecated)]
             if let Some(account) = stake_config_account {
                 let _ = svm_writer.inner.svm.set_account(
                     solana_sdk_ids::stake::config::id(),
                     account,
                 );
-            }
-            if let Some((program_account, programdata_account)) = stake_program_accounts {
-                let programdata_address =
-                    solana_loader_v3_interface::get_program_data_address(
-                        &solana_sdk_ids::stake::id(),
-                    );
-                let _ = svm_writer
-                    .inner
-                    .svm
-                    .set_account(programdata_address, programdata_account);
-                let _ = svm_writer
-                    .inner
-                    .svm
-                    .set_account(solana_sdk_ids::stake::id(), program_account);
             }
         });
         Ok(())
