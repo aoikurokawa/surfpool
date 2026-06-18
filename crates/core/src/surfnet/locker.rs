@@ -49,7 +49,7 @@ use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta,
     TransactionConfirmationStatus as SolanaTransactionConfirmationStatus, UiConfirmedBlock,
-    UiTransactionEncoding,
+    UiTransactionEncoding, VersionedTransactionWithStatusMeta, extract_and_fmt_memos,
 };
 use surfpool_types::{
     AccountSnapshot, ComputeUnitsEstimationResult, ExecutionCapture, ExportSnapshotConfig, Idl,
@@ -894,14 +894,28 @@ impl SurfnetSvmLocker {
                             _ => SolanaTransactionConfirmationStatus::Finalized,
                         };
 
+                        // Reconstruct the memo summary the same way a full Agave validator
+                        // does, reusing its canonical extractor. `account_keys()` on the
+                        // wrapper folds in `meta.loaded_addresses`, so memos invoked via an
+                        // address lookup table are handled too.
+                        let tx_with_meta = VersionedTransactionWithStatusMeta { transaction, meta };
+                        let memo = extract_and_fmt_memos(&tx_with_meta);
+                        let err = match &tx_with_meta.meta.status {
+                            Ok(_) => None,
+                            Err(e) => Some(e.clone().into()),
+                        };
+
+                        // Synthesize the block time from the slot, matching `getBlockTime`
+                        // (and real Agave). `calculate_block_time_for_slot` returns
+                        // milliseconds, so divide by 1000 to get `UnixTimestamp` seconds.
+                        let block_time =
+                            Some((svm_reader.calculate_block_time_for_slot(slot) / 1_000) as i64);
+
                         Some(RpcConfirmedTransactionStatusWithSignature {
-                            err: match meta.status {
-                                Ok(_) => None,
-                                Err(e) => Some(e.into()),
-                            },
+                            err,
                             slot,
-                            memo: None,
-                            block_time: None,
+                            memo,
+                            block_time,
                             confirmation_status: Some(confirmation_status),
                             signature: sig,
                         })
@@ -4657,6 +4671,119 @@ mod tests {
                 *sanitized_transaction.signature(),
                 tx_signature,
                 "Account update should carry transaction signature"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_signatures_for_address_local_populates_memo_and_block_time() {
+        use std::str::FromStr;
+
+        use crossbeam_channel::unbounded;
+        use solana_instruction::Instruction;
+        use solana_keypair::Keypair;
+        use solana_message::{VersionedMessage, v0};
+        use solana_signer::Signer;
+        use solana_system_interface::instruction as system_instruction;
+        use solana_transaction::versioned::VersionedTransaction;
+
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+
+        let payer = Keypair::new();
+        let payer_pubkey = payer.pubkey();
+        let recipient = Pubkey::new_unique();
+
+        let _ = locker
+            .airdrop(&payer_pubkey, 1_000_000_000)
+            .expect("airdrop should succeed");
+
+        // SPL Memo v3 program id — the one `solana ... --with-memo` emits and the one
+        // `extract_and_fmt_memos` recognizes.
+        let memo_program = Pubkey::from_str("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr").unwrap();
+
+        // Helper: build, sign, and process a v0 transaction made of the given instructions.
+        async fn process(
+            locker: &SurfnetSvmLocker,
+            payer: &Keypair,
+            instructions: &[Instruction],
+        ) -> String {
+            let blockhash = locker.latest_absolute_blockhash();
+            let message = v0::Message::try_compile(&payer.pubkey(), instructions, &[], blockhash)
+                .expect("v0 message should compile");
+            let tx = VersionedTransaction::try_new(
+                VersionedMessage::V0(message),
+                &[payer.insecure_clone()],
+            )
+            .expect("v0 transaction should sign");
+            let signature = tx.signatures[0].to_string();
+            let (status_tx, _status_rx) = unbounded();
+            locker
+                .process_transaction(&None, tx, status_tx, true, true)
+                .await
+                .expect("transaction processing should succeed");
+            signature
+        }
+
+        // tx A: transfer + memo instruction.
+        let sig_with_memo = process(
+            &locker,
+            &payer,
+            &[
+                system_instruction::transfer(&payer_pubkey, &recipient, 1_000_000),
+                Instruction {
+                    program_id: memo_program,
+                    accounts: vec![],
+                    data: b"hello-memo".to_vec(),
+                },
+            ],
+        )
+        .await;
+
+        // tx B: plain transfer, no memo (negative control).
+        let sig_without_memo = process(
+            &locker,
+            &payer,
+            &[system_instruction::transfer(
+                &payer_pubkey,
+                &recipient,
+                1_000_000,
+            )],
+        )
+        .await;
+
+        let SvmAccessContext { inner: sigs, .. } =
+            locker.get_signatures_for_address_local(&payer_pubkey, None);
+
+        let row_with_memo = sigs
+            .iter()
+            .find(|s| s.signature == sig_with_memo)
+            .expect("memo-bearing tx should appear in getSignaturesForAddress");
+        let row_without_memo = sigs
+            .iter()
+            .find(|s| s.signature == sig_without_memo)
+            .expect("plain tx should appear in getSignaturesForAddress");
+
+        assert_eq!(
+            row_with_memo.memo,
+            Some("[10] hello-memo".to_string()),
+            "memo-bearing tx should expose the Agave-formatted memo summary"
+        );
+        assert_eq!(
+            row_without_memo.memo, None,
+            "plain transfer must still yield a null memo"
+        );
+
+        // block_time is synthesized from the slot and must match `getBlockTime`.
+        // `calculate_block_time_for_slot` returns milliseconds; the summary field is
+        // `UnixTimestamp` seconds, so it is scaled down by 1000.
+        for row in [row_with_memo, row_without_memo] {
+            let expected = (locker.with_svm_reader(|r| r.calculate_block_time_for_slot(row.slot))
+                / 1_000) as i64;
+            assert_eq!(
+                row.block_time,
+                Some(expected),
+                "block_time should be the slot's synthetic unix-seconds time"
             );
         }
     }
